@@ -1,0 +1,110 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: wagering
+      POSTGRES_USER: wagering
+      POSTGRES_PASSWORD: wagering
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wagering -d wagering"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  localstack:
+    image: localstack/localstack:4
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+      PERSISTENCE: "1"
+    ports:
+      - "${LOCALSTACK_HOST_PORT:-4566}:4566"
+    volumes:
+      - "./docker/localstack:/etc/localstack/init/ready.d:ro"
+      - localstack_data:/var/lib/localstack
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          awslocal sqs get-queue-url --queue-name wager-transactions.fifo >/dev/null &&
+          awslocal sqs get-queue-url --queue-name wager-transactions-dlq.fifo >/dev/null &&
+          awslocal sqs get-queue-url --queue-name wager-events.fifo >/dev/null
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  app:
+    build: .
+    command: ["bun", "run", "dev"]
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      METRICS_PORT: 9464
+      DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering
+      SQS_ENDPOINT: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_TRANSACTION_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions.fifo
+      SQS_DEAD_LETTER_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions-dlq.fifo
+      SQS_EVENT_QUEUE_URL: http://localstack:4566/000000000000/wager-events.fifo
+      WORKERS_ENABLED: "true"
+      DEAD_LETTER_RETENTION_DAYS: ${DEAD_LETTER_RETENTION_DAYS:-90}
+      DEAD_LETTER_RETENTION_BATCH_SIZE: ${DEAD_LETTER_RETENTION_BATCH_SIZE:-500}
+      DEAD_LETTER_RETENTION_INTERVAL_MS: ${DEAD_LETTER_RETENTION_INTERVAL_MS:-86400000}
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test:
+        - CMD
+        - bun
+        - -e
+        - fetch('http://127.0.0.1:3000/health/ready').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - .:/app
+      - app_node_modules:/app/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: ["bun", "run", "start:worker"]
+    environment:
+      NODE_ENV: development
+      METRICS_PORT: 9464
+      DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering
+      SQS_ENDPOINT: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_TRANSACTION_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions.fifo
+      SQS_DEAD_LETTER_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions-dlq.fifo
+      SQS_EVENT_QUEUE_URL: http://localstack:4566/000000000000/wager-events.fifo
+      WORKERS_ENABLED: "true"
+      DEAD_LETTER_RETENTION_DAYS: ${DEAD_LETTER_RETENTION_DAYS:-90}
+      DEAD_LETTER_RETENTION_BATCH_SIZE: ${DEAD_LETTER_RETENTION_BATCH_SIZE:-500}
+      DEAD_LETTER_RETENTION_INTERVAL_MS: ${DEAD_LETTER_RETENTION_INTERVAL_MS:-86400000}
+    depends_on:
+      app:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    expose:
+      - "9464"
+
+volumes:
+  postgres_data:
+  localstack_data:
+  app_node_modules:
