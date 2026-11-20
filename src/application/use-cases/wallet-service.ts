@@ -20,6 +20,11 @@ import { MetricsService } from "../../infrastructure/observability/metrics.servi
 import { StructuredLogger } from "../../infrastructure/observability/structured-logger";
 import { DATA_SOURCE } from "../../infrastructure/persistence/data-source";
 import {
+  insertLedgerEntry,
+  insertOutboxEvent,
+} from "../../infrastructure/persistence/financial-records";
+import { postgresErrorCode } from "../../infrastructure/persistence/postgres-error";
+import {
   ApplicationError,
   ConflictApplicationError,
   NotFoundApplicationError,
@@ -129,7 +134,7 @@ export class WalletService {
       return this.toWalletResponse(wallet);
     } catch (error) {
       if (runner.isTransactionActive) await runner.rollbackTransaction();
-      if (this.sqlState(error) === "23505") {
+      if (postgresErrorCode(error) === "23505") {
         throw new ConflictApplicationError(
           "WALLET_ALREADY_EXISTS",
           "A wallet already exists for this player and currency",
@@ -316,23 +321,7 @@ export class WalletService {
         at,
       ],
     );
-    await runner.query(
-      `INSERT INTO wallet_ledger_entries (
-        id, wallet_id, transaction_id, direction, amount, currency,
-        balance_before, balance_after, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [
-        entry.id,
-        entry.walletId,
-        entry.transactionId,
-        entry.direction,
-        entry.money.toString(),
-        entry.money.currency,
-        entry.balanceBefore.toString(),
-        entry.balanceAfter.toString(),
-        entry.createdAt,
-      ],
-    );
+    await insertLedgerEntry(runner, entry);
 
     const processed = new WagerTransactionProcessed({
       eventId: randomUUID(),
@@ -349,14 +338,7 @@ export class WalletService {
         money: initialBalance.toJSON(),
       },
     });
-    await this.insertOutbox(
-      runner,
-      processed.eventId,
-      wallet.id,
-      processed.eventType,
-      processed.toJSON(),
-      at,
-    );
+    await insertOutboxEvent(runner, processed);
     const changed = new WalletBalanceChanged({
       eventId: randomUUID(),
       aggregateId: wallet.id,
@@ -372,29 +354,7 @@ export class WalletService {
         walletVersion: wallet.version,
       },
     });
-    await this.insertOutbox(
-      runner,
-      changed.eventId,
-      wallet.id,
-      changed.eventType,
-      changed.toJSON(),
-      at,
-    );
-  }
-
-  private async insertOutbox(
-    runner: QueryRunner,
-    id: string,
-    aggregateId: string,
-    eventType: string,
-    payload: unknown,
-    occurredAt: Date,
-  ): Promise<void> {
-    await runner.query(
-      `INSERT INTO outbox_messages (id, aggregate_id, event_type, payload, occurred_at, created_at)
-       VALUES ($1, $2, $3, $4::jsonb, $5, clock_timestamp())`,
-      [id, aggregateId, eventType, JSON.stringify(payload), occurredAt],
-    );
+    await insertOutboxEvent(runner, changed);
   }
 
   private toWalletResponse(wallet: Wallet): WalletResponse {
@@ -436,17 +396,10 @@ export class WalletService {
       };
     } catch {
       throw new ApplicationError(
-        "INVALID_CURSOR",
         "Ledger cursor is invalid",
+        "INVALID_CURSOR",
         400,
       );
     }
-  }
-
-  private sqlState(error: unknown): string | undefined {
-    if (typeof error !== "object" || error === null || !("code" in error))
-      return undefined;
-    const code = (error as { code?: unknown }).code;
-    return typeof code === "string" ? code : undefined;
   }
 }
