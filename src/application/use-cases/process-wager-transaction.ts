@@ -23,6 +23,11 @@ import { MetricsService } from "../../infrastructure/observability/metrics.servi
 import { StructuredLogger } from "../../infrastructure/observability/structured-logger";
 import { DATA_SOURCE } from "../../infrastructure/persistence/data-source";
 import {
+  insertLedgerEntry,
+  insertOutboxEvent,
+} from "../../infrastructure/persistence/financial-records";
+import { postgresErrorCode } from "../../infrastructure/persistence/postgres-error";
+import {
   ApplicationError,
   ConflictApplicationError,
   NotFoundApplicationError,
@@ -114,7 +119,6 @@ interface PendingTransactionRow {
 interface TransactionEventProps {
   transaction: WagerTransaction;
   status: WagerTransactionStatus;
-  balance: Money;
   correlationId: string;
   causationId?: string;
   failureCode?: string;
@@ -368,7 +372,6 @@ export class ProcessWagerTransaction {
         await this.enqueueTransactionEvent(runner, {
           transaction,
           status: WagerTransactionStatus.PendingReference,
-          balance: wallet.balance,
           correlationId: input.correlationId ?? transaction.id,
           ...(inbox ? { causationId: inbox.messageId } : {}),
         });
@@ -437,7 +440,6 @@ export class ProcessWagerTransaction {
         await this.enqueueTransactionEvent(runner, {
           transaction,
           status: WagerTransactionStatus.Processed,
-          balance: wallet.balance,
           correlationId: input.correlationId ?? transaction.id,
           ...(inbox ? { causationId: inbox.messageId } : {}),
         });
@@ -504,7 +506,7 @@ export class ProcessWagerTransaction {
           wallet.updatedAt,
         ],
       );
-      await this.insertLedgerEntry(runner, ledgerEntry);
+      await insertLedgerEntry(runner, ledgerEntry);
       transaction.markProcessed(referenceRow?.id, new Date());
       const response = this.result(
         transaction.id,
@@ -520,13 +522,11 @@ export class ProcessWagerTransaction {
       await this.enqueueTransactionEvent(runner, {
         transaction,
         status: WagerTransactionStatus.Processed,
-        balance: wallet.balance,
         correlationId: input.correlationId ?? transaction.id,
         ...(inbox ? { causationId: inbox.messageId } : {}),
       });
       await this.enqueueBalanceChanged(
         runner,
-        transaction,
         ledgerEntry,
         wallet.version,
         input.correlationId ?? transaction.id,
@@ -550,7 +550,7 @@ export class ProcessWagerTransaction {
       return response;
     } catch (error) {
       if (runner.isTransactionActive) await runner.rollbackTransaction();
-      const code = this.sqlState(error);
+      const code = postgresErrorCode(error);
       if (code === "40001" || code === "40P01" || code === "55P03") {
         this.metrics.recordLockConflict(code);
         throw new RetryableInfrastructureError();
@@ -654,7 +654,6 @@ export class ProcessWagerTransaction {
           await this.finishPendingRejection(
             runner,
             transaction,
-            wallet.balance,
             "REFERENCE_NOT_FOUND",
             attempts,
           );
@@ -690,7 +689,6 @@ export class ProcessWagerTransaction {
         await this.finishPendingRejection(
           runner,
           transaction,
-          wallet.balance,
           reference.code,
           row.reference_attempts,
         );
@@ -709,7 +707,6 @@ export class ProcessWagerTransaction {
         await this.finishPendingRejection(
           runner,
           transaction,
-          wallet.balance,
           "REFERENCE_INVALID",
           row.reference_attempts,
         );
@@ -727,7 +724,6 @@ export class ProcessWagerTransaction {
           await this.finishPendingRejection(
             runner,
             transaction,
-            wallet.balance,
             "REFERENCE_ALREADY_REVERSED",
             row.reference_attempts,
             referenceRow.id,
@@ -765,7 +761,6 @@ export class ProcessWagerTransaction {
           await this.finishPendingRejection(
             runner,
             transaction,
-            wallet.balance,
             transaction.kind === WagerTransactionKind.Rollback
               ? "ROLLBACK_INSUFFICIENT_BALANCE"
               : "INSUFFICIENT_BALANCE",
@@ -788,7 +783,7 @@ export class ProcessWagerTransaction {
           wallet.updatedAt,
         ],
       );
-      await this.insertLedgerEntry(runner, entry);
+      await insertLedgerEntry(runner, entry);
       transaction.markProcessed(referenceRow.id, new Date());
       await runner.query(
         `UPDATE wager_transactions SET status = 'PROCESSED', reference_transaction_id = $3,
@@ -800,12 +795,10 @@ export class ProcessWagerTransaction {
       await this.enqueueTransactionEvent(runner, {
         transaction,
         status: WagerTransactionStatus.Processed,
-        balance: wallet.balance,
         correlationId: transaction.id,
       });
       await this.enqueueBalanceChanged(
         runner,
-        transaction,
         entry,
         wallet.version,
         transaction.id,
@@ -824,7 +817,7 @@ export class ProcessWagerTransaction {
       });
     } catch (error) {
       if (runner.isTransactionActive) await runner.rollbackTransaction();
-      const code = this.sqlState(error);
+      const code = postgresErrorCode(error);
       if (code === "40001" || code === "40P01" || code === "55P03") {
         this.metrics.recordLockConflict(code);
         throw new RetryableInfrastructureError();
@@ -1042,7 +1035,6 @@ export class ProcessWagerTransaction {
     await this.enqueueTransactionEvent(runner, {
       transaction,
       status: WagerTransactionStatus.Rejected,
-      balance,
       correlationId: input.correlationId ?? transaction.id,
       ...(inbox ? { causationId: inbox.messageId } : {}),
       failureCode,
@@ -1108,7 +1100,6 @@ export class ProcessWagerTransaction {
   private async finishPendingRejection(
     runner: QueryRunner,
     transaction: WagerTransaction,
-    balance: Money,
     failureCode: string,
     attempts: number,
     referenceTransactionId?: string,
@@ -1124,33 +1115,9 @@ export class ProcessWagerTransaction {
     await this.enqueueTransactionEvent(runner, {
       transaction,
       status: WagerTransactionStatus.Rejected,
-      balance,
       correlationId: transaction.id,
       failureCode,
     });
-  }
-
-  private async insertLedgerEntry(
-    runner: QueryRunner,
-    entry: WalletLedgerEntry,
-  ): Promise<void> {
-    await runner.query(
-      `INSERT INTO wallet_ledger_entries (
-        id, wallet_id, transaction_id, direction, amount, currency,
-        balance_before, balance_after, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [
-        entry.id,
-        entry.walletId,
-        entry.transactionId,
-        entry.direction,
-        entry.money.toString(),
-        entry.money.currency,
-        entry.balanceBefore.toString(),
-        entry.balanceAfter.toString(),
-        entry.createdAt,
-      ],
-    );
   }
 
   private async enqueueTransactionEvent(
@@ -1186,19 +1153,11 @@ export class ProcessWagerTransaction {
         : props.status === WagerTransactionStatus.PendingReference
           ? new WagerTransactionPendingReference(eventProps)
           : new WagerTransactionRejected(eventProps);
-    await this.insertOutbox(
-      runner,
-      event.eventId,
-      event.aggregateId,
-      event.eventType,
-      event.toJSON(),
-      event.occurredAt,
-    );
+    await insertOutboxEvent(runner, event);
   }
 
   private async enqueueBalanceChanged(
     runner: QueryRunner,
-    transaction: WagerTransaction,
     entry: WalletLedgerEntry,
     version: number,
     correlationId: string,
@@ -1206,7 +1165,7 @@ export class ProcessWagerTransaction {
   ): Promise<void> {
     const event = new WalletBalanceChanged({
       eventId: randomUUID(),
-      aggregateId: transaction.walletId,
+      aggregateId: entry.walletId,
       correlationId,
       ...(inbox ? { causationId: inbox.messageId } : {}),
       occurredAt: entry.createdAt,
@@ -1220,29 +1179,7 @@ export class ProcessWagerTransaction {
         walletVersion: version,
       },
     });
-    await this.insertOutbox(
-      runner,
-      event.eventId,
-      event.aggregateId,
-      event.eventType,
-      event.toJSON(),
-      event.occurredAt,
-    );
-  }
-
-  private async insertOutbox(
-    runner: QueryRunner,
-    id: string,
-    aggregateId: string,
-    eventType: string,
-    payload: unknown,
-    occurredAt: Date,
-  ): Promise<void> {
-    await runner.query(
-      `INSERT INTO outbox_messages (id, aggregate_id, event_type, payload, occurred_at, created_at)
-       VALUES ($1, $2, $3, $4::jsonb, $5, clock_timestamp())`,
-      [id, aggregateId, eventType, JSON.stringify(payload), occurredAt],
-    );
+    await insertOutboxEvent(runner, event);
   }
 
   private isReversal(kind: WagerTransactionKind): boolean {
@@ -1250,12 +1187,5 @@ export class ProcessWagerTransaction {
       kind === WagerTransactionKind.Refund ||
       kind === WagerTransactionKind.Rollback
     );
-  }
-
-  private sqlState(error: unknown): string | undefined {
-    if (typeof error !== "object" || error === null || !("code" in error))
-      return undefined;
-    const code = (error as { code?: unknown }).code;
-    return typeof code === "string" ? code : undefined;
   }
 }
